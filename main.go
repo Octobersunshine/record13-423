@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +58,13 @@ var (
 	prevStats   map[string]DiskStats
 	prevTime    time.Time
 	statsMutex  sync.RWMutex
+
+	sdaPattern    = regexp.MustCompile(`^[a-z]+d[a-z]+$`)
+	nvmePattern   = regexp.MustCompile(`^nvme\d+n\d+$`)
+	mmcPattern    = regexp.MustCompile(`^mmcblk\d+$`)
+	mdPattern     = regexp.MustCompile(`^md\d+$`)
+	vdaPattern    = regexp.MustCompile(`^vd[a-z]+$`)
+	xvdPattern    = regexp.MustCompile(`^xvd[a-z]+$`)
 )
 
 func readDiskStats() (map[string]DiskStats, error) {
@@ -104,28 +113,48 @@ func readDiskStats() (map[string]DiskStats, error) {
 }
 
 func isPhysicalDisk(name string) bool {
-	if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") || strings.HasPrefix(name, "sr") {
-		return false
-	}
 	if len(name) == 0 {
 		return false
 	}
-	lastChar := name[len(name)-1]
-	if lastChar >= '0' && lastChar <= '9' {
+	if strings.HasPrefix(name, "loop") || strings.HasPrefix(name, "ram") || strings.HasPrefix(name, "sr") {
 		return false
 	}
-	return true
+	if sdaPattern.MatchString(name) {
+		return true
+	}
+	if nvmePattern.MatchString(name) {
+		return true
+	}
+	if mmcPattern.MatchString(name) {
+		return true
+	}
+	if mdPattern.MatchString(name) {
+		return true
+	}
+	if vdaPattern.MatchString(name) {
+		return true
+	}
+	if xvdPattern.MatchString(name) {
+		return true
+	}
+	return false
 }
 
 func calculateMetrics(curr, prev map[string]DiskStats, deltaTime time.Duration) []DiskMetrics {
 	metrics := make([]DiskMetrics, 0)
 	deltaSec := deltaTime.Seconds()
 
-	for name, currDs := range curr {
-		prevDs, ok := prev[name]
-		if !ok {
-			continue
+	names := make([]string, 0, len(curr))
+	for name := range curr {
+		if _, ok := prev[name]; ok {
+			names = append(names, name)
 		}
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		currDs := curr[name]
+		prevDs := prev[name]
 
 		dm := DiskMetrics{Name: name}
 
@@ -253,6 +282,13 @@ func main() {
 	if err != nil {
 		log.Printf("warning: failed to read initial disk stats: %v", err)
 	} else {
+		diskNames := make([]string, 0, len(initialStats))
+		for name := range initialStats {
+			diskNames = append(diskNames, name)
+		}
+		sort.Strings(diskNames)
+		log.Printf("detected %d physical disk(s): %v", len(diskNames), diskNames)
+
 		statsMutex.Lock()
 		prevStats = initialStats
 		prevTime = time.Now()
