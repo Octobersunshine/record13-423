@@ -31,16 +31,21 @@ type DiskStats struct {
 }
 
 type DiskMetrics struct {
-	Name              string  `json:"name"`
-	ReadBytesPerSec   float64 `json:"read_bytes_per_sec"`
-	WriteBytesPerSec  float64 `json:"write_bytes_per_sec"`
-	ReadIOPS          float64 `json:"read_iops"`
-	WriteIOPS         float64 `json:"write_iops"`
-	AvgReadWaitMs     float64 `json:"avg_read_wait_ms"`
-	AvgWriteWaitMs    float64 `json:"avg_write_wait_ms"`
-	AvgIOWaitMs       float64 `json:"avg_io_wait_ms"`
-	UtilizationPct    float64 `json:"utilization_pct"`
-	IOPending         uint64  `json:"io_pending"`
+	Name             string  `json:"name"`
+	ReadBytesPerSec  float64 `json:"read_bytes_per_sec"`
+	WriteBytesPerSec float64 `json:"write_bytes_per_sec"`
+	ReadIOPS         float64 `json:"read_iops"`
+	WriteIOPS        float64 `json:"write_iops"`
+	AvgReadWaitMs    float64 `json:"avg_read_wait_ms"`
+	AvgWriteWaitMs   float64 `json:"avg_write_wait_ms"`
+	AvgIOWaitMs      float64 `json:"avg_io_wait_ms"`
+	UtilizationPct   float64 `json:"utilization_pct"`
+	IOPending        uint64  `json:"io_pending"`
+}
+
+type MetricsPoint struct {
+	Timestamp time.Time     `json:"timestamp"`
+	Disks     []DiskMetrics `json:"disks"`
 }
 
 type MetricsResponse struct {
@@ -48,23 +53,36 @@ type MetricsResponse struct {
 	Disks     []DiskMetrics `json:"disks"`
 }
 
+type HistoryResponse struct {
+	StartTime time.Time     `json:"start_time"`
+	EndTime   time.Time     `json:"end_time"`
+	Points    int           `json:"points"`
+	Interval  string        `json:"interval"`
+	Data      []MetricsPoint `json:"data"`
+}
+
 const (
-	sectorSize     = 512
-	diskStatsPath  = "/proc/diskstats"
-	monitorPort    = ":8080"
+	sectorSize       = 512
+	diskStatsPath    = "/proc/diskstats"
+	monitorPort      = ":8080"
+	historyMaxPoints = 300
+	collectInterval  = 1 * time.Second
 )
 
 var (
-	prevStats   map[string]DiskStats
-	prevTime    time.Time
-	statsMutex  sync.RWMutex
+	historyBuffer []MetricsPoint
+	historyMutex  sync.RWMutex
 
-	sdaPattern    = regexp.MustCompile(`^[a-z]+d[a-z]+$`)
-	nvmePattern   = regexp.MustCompile(`^nvme\d+n\d+$`)
-	mmcPattern    = regexp.MustCompile(`^mmcblk\d+$`)
-	mdPattern     = regexp.MustCompile(`^md\d+$`)
-	vdaPattern    = regexp.MustCompile(`^vd[a-z]+$`)
-	xvdPattern    = regexp.MustCompile(`^xvd[a-z]+$`)
+	lastStats     map[string]DiskStats
+	lastStatsTime time.Time
+	lastStatsMu   sync.RWMutex
+
+	sdaPattern  = regexp.MustCompile(`^[a-z]+d[a-z]+$`)
+	nvmePattern = regexp.MustCompile(`^nvme\d+n\d+$`)
+	mmcPattern  = regexp.MustCompile(`^mmcblk\d+$`)
+	mdPattern   = regexp.MustCompile(`^md\d+$`)
+	vdaPattern  = regexp.MustCompile(`^vd[a-z]+$`)
+	xvdPattern  = regexp.MustCompile(`^xvd[a-z]+$`)
 )
 
 func readDiskStats() (map[string]DiskStats, error) {
@@ -143,6 +161,9 @@ func isPhysicalDisk(name string) bool {
 func calculateMetrics(curr, prev map[string]DiskStats, deltaTime time.Duration) []DiskMetrics {
 	metrics := make([]DiskMetrics, 0)
 	deltaSec := deltaTime.Seconds()
+	if deltaSec <= 0 {
+		return metrics
+	}
 
 	names := make([]string, 0, len(curr))
 	for name := range curr {
@@ -188,6 +209,9 @@ func calculateMetrics(curr, prev map[string]DiskStats, deltaTime time.Duration) 
 		if dm.UtilizationPct > 100.0 {
 			dm.UtilizationPct = 100.0
 		}
+		if dm.UtilizationPct < 0 {
+			dm.UtilizationPct = 0
+		}
 
 		dm.IOPending = currDs.IOPending
 
@@ -197,38 +221,60 @@ func calculateMetrics(curr, prev map[string]DiskStats, deltaTime time.Duration) 
 	return metrics
 }
 
+func appendHistory(point MetricsPoint) {
+	historyMutex.Lock()
+	defer historyMutex.Unlock()
+
+	if len(historyBuffer) >= historyMaxPoints {
+		historyBuffer = historyBuffer[1:]
+	}
+	historyBuffer = append(historyBuffer, point)
+}
+
+func getHistoryCopy() []MetricsPoint {
+	historyMutex.RLock()
+	defer historyMutex.RUnlock()
+
+	result := make([]MetricsPoint, len(historyBuffer))
+	copy(result, historyBuffer)
+	return result
+}
+
 func collectLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+	prev, err := readDiskStats()
+	if err != nil {
+		log.Printf("initial stats read failed: %v", err)
+	}
+	prevTime := time.Now()
+
+	ticker := time.NewTicker(collectInterval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		currStats, err := readDiskStats()
+		curr, err := readDiskStats()
 		if err != nil {
-			log.Printf("failed to read disk stats: %v", err)
+			log.Printf("read disk stats failed: %v", err)
 			continue
 		}
 		currTime := time.Now()
 
-		statsMutex.Lock()
-		prevStats = currStats
-		prevTime = currTime
-		statsMutex.Unlock()
-
-		<-ticker.C
-		currStats2, err := readDiskStats()
-		if err != nil {
-			log.Printf("failed to read disk stats (second sample): %v", err)
-			continue
+		if prev != nil && len(prev) > 0 {
+			delta := currTime.Sub(prevTime)
+			metrics := calculateMetrics(curr, prev, delta)
+			point := MetricsPoint{
+				Timestamp: currTime,
+				Disks:     metrics,
+			}
+			appendHistory(point)
 		}
-		currTime2 := time.Now()
-		deltaTime := currTime2.Sub(currTime)
 
-		statsMutex.Lock()
-		prevStats = currStats2
-		prevTime = currTime2
-		statsMutex.Unlock()
+		lastStatsMu.Lock()
+		lastStats = curr
+		lastStatsTime = currTime
+		lastStatsMu.Unlock()
 
-		_ = calculateMetrics(currStats2, currStats, deltaTime)
+		prev = curr
+		prevTime = currTime
 	}
 }
 
@@ -236,45 +282,44 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	currStats, err := readDiskStats()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to read disk stats: %v", err), http.StatusInternalServerError)
-		return
-	}
-	currTime := time.Now()
-
-	statsMutex.RLock()
-	pStats := prevStats
-	pTime := prevTime
-	statsMutex.RUnlock()
-
-	if pStats == nil || len(pStats) == 0 {
-		time.Sleep(1 * time.Second)
-		currStats2, err := readDiskStats()
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to read disk stats: %v", err), http.StatusInternalServerError)
-			return
+	history := getHistoryCopy()
+	if len(history) == 0 {
+		emptyResp := MetricsResponse{
+			Timestamp: time.Now(),
+			Disks:     []DiskMetrics{},
 		}
-		currTime2 := time.Now()
-		deltaTime := currTime2.Sub(currTime)
-
-		metrics := calculateMetrics(currStats2, currStats, deltaTime)
-		response := MetricsResponse{
-			Timestamp: currTime2,
-			Disks:     metrics,
-		}
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(emptyResp)
 		return
 	}
 
-	deltaTime := currTime.Sub(pTime)
-	metrics := calculateMetrics(currStats, pStats, deltaTime)
-
-	response := MetricsResponse{
-		Timestamp: currTime,
-		Disks:     metrics,
+	latest := history[len(history)-1]
+	resp := MetricsResponse{
+		Timestamp: latest.Timestamp,
+		Disks:     latest.Disks,
 	}
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func historyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	data := getHistoryCopy()
+
+	resp := HistoryResponse{
+		Points:   len(data),
+		Interval: collectInterval.String(),
+		Data:     data,
+	}
+	if len(data) > 0 {
+		resp.StartTime = data[0].Timestamp
+		resp.EndTime = data[len(data)-1].Timestamp
+	} else {
+		resp.StartTime = time.Time{}
+		resp.EndTime = time.Time{}
+	}
+
+	json.NewEncoder(w).Encode(resp)
 }
 
 func main() {
@@ -289,13 +334,19 @@ func main() {
 		sort.Strings(diskNames)
 		log.Printf("detected %d physical disk(s): %v", len(diskNames), diskNames)
 
-		statsMutex.Lock()
-		prevStats = initialStats
-		prevTime = time.Now()
-		statsMutex.Unlock()
+		lastStatsMu.Lock()
+		lastStats = initialStats
+		lastStatsTime = time.Now()
+		lastStatsMu.Unlock()
 	}
 
+	historyBuffer = make([]MetricsPoint, 0, historyMaxPoints)
+
+	go collectLoop()
+	log.Printf("started background collection (interval=%s, max_points=%d)", collectInterval, historyMaxPoints)
+
 	http.HandleFunc("/api/diskio", metricsHandler)
+	http.HandleFunc("/api/diskio/history", historyHandler)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -303,6 +354,7 @@ func main() {
 
 	log.Printf("disk IO monitor starting on %s", monitorPort)
 	log.Printf("metrics endpoint: http://localhost%s/api/diskio", monitorPort)
+	log.Printf("history endpoint: http://localhost%s/api/diskio/history", monitorPort)
 
 	if err := http.ListenAndServe(monitorPort, nil); err != nil {
 		log.Fatalf("server failed: %v", err)
